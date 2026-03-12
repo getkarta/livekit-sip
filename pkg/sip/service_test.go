@@ -12,6 +12,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/icholy/digest"
 	msdk "github.com/livekit/media-sdk"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
@@ -948,4 +949,122 @@ func TestSameCallIDForAuthFlow(t *testing.T) {
 
 	t.Logf("First call ID: %s", capturedCallIDs[0])
 	t.Logf("Second call ID: %s", capturedCallIDs[1])
+}
+
+func TestGetAllowedNodeIPs(t *testing.T) {
+	tests := []struct {
+		name     string
+		attrs    map[string]string
+		expected []string
+	}{
+		{
+			name:     "nil attributes",
+			attrs:    nil,
+			expected: nil,
+		},
+		{
+			name:     "empty attributes",
+			attrs:    map[string]string{},
+			expected: nil,
+		},
+		{
+			name:     "missing key",
+			attrs:    map[string]string{"other": "value"},
+			expected: nil,
+		},
+		{
+			name:     "empty value",
+			attrs:    map[string]string{"allowed_node_ips": ""},
+			expected: nil,
+		},
+		{
+			name:     "invalid json",
+			attrs:    map[string]string{"allowed_node_ips": "not-json"},
+			expected: nil,
+		},
+		{
+			name:     "single IP",
+			attrs:    map[string]string{"allowed_node_ips": `["10.0.0.1"]`},
+			expected: []string{"10.0.0.1"},
+		},
+		{
+			name:     "multiple IPs",
+			attrs:    map[string]string{"allowed_node_ips": `["10.0.0.1", "13.233.54.246"]`},
+			expected: []string{"10.0.0.1", "13.233.54.246"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := getAllowedNodeIPs(tt.attrs)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestCreateSIPParticipantAffinity(t *testing.T) {
+	tests := []struct {
+		name     string
+		natIP    string
+		attrs    map[string]string
+		expected float32
+	}{
+		{
+			name:     "no allowed_node_ips returns default affinity",
+			natIP:    "10.0.0.1",
+			attrs:    nil,
+			expected: 0.5,
+		},
+		{
+			name:     "matching IP returns affinity",
+			natIP:    "10.0.0.1",
+			attrs:    map[string]string{"allowed_node_ips": `["10.0.0.1"]`},
+			expected: 0.5,
+		},
+		{
+			name:     "non-matching IP returns zero",
+			natIP:    "10.0.0.1",
+			attrs:    map[string]string{"allowed_node_ips": `["10.0.0.2"]`},
+			expected: 0,
+		},
+		{
+			name:     "matching one of multiple IPs",
+			natIP:    "13.233.54.246",
+			attrs:    map[string]string{"allowed_node_ips": `["10.0.0.1", "13.233.54.246"]`},
+			expected: 0.5,
+		},
+		{
+			name:     "no match among multiple IPs",
+			natIP:    "192.168.1.1",
+			attrs:    map[string]string{"allowed_node_ips": `["10.0.0.1", "13.233.54.246"]`},
+			expected: 0,
+		},
+		{
+			name:     "invalid json falls back to default",
+			natIP:    "10.0.0.1",
+			attrs:    map[string]string{"allowed_node_ips": "bad-json"},
+			expected: 0.5,
+		},
+		{
+			name:     "empty allowed_node_ips falls back to default",
+			natIP:    "10.0.0.1",
+			attrs:    map[string]string{"allowed_node_ips": ""},
+			expected: 0.5,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Service{
+				conf: &config.Config{
+					NAT1To1IP: tt.natIP,
+				},
+			}
+			req := &rpc.InternalCreateSIPParticipantRequest{
+				ParticipantAttributes: tt.attrs,
+			}
+			result := s.CreateSIPParticipantAffinity(context.Background(), req)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
 }
