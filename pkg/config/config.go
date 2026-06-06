@@ -122,8 +122,8 @@ type Config struct {
 	NodeID      string // Do not provide, will be overwritten
 	JaegerURL   string `yaml:"jaeger_url"` // for tracing
 
-	// FlowIDLookup maps flow_id values from the User-to-User SIP header to calling
-	// numbers used when evaluating dispatch rules.
+	// FlowIDLookup maps flow_id values from the User-to-User SIP header to dialed
+	// numbers used for trunk and dispatch rule matching.
 	FlowIDLookup map[string]string `yaml:"flow_id_lookup"`
 
 	// Experimental, these option might go away without notice.
@@ -164,7 +164,7 @@ func (c *Config) loadFlowIDLookup() error {
 	return nil
 }
 
-// LookupFlowIDNumber returns the dispatch calling number configured for a flow_id.
+// LookupFlowIDNumber returns the dialed number configured for a flow_id.
 func (c *Config) LookupFlowIDNumber(flowID string) (string, bool) {
 	if c == nil || flowID == "" {
 		return "", false

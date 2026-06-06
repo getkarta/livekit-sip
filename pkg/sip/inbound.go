@@ -441,14 +441,14 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 
 	if uui := rheaders.GetHeader("User-to-User"); uui != nil {
 		if flowID, ok := parseUserToUserFlowID(uui.Value()); ok {
-			dispatchNumber, mapped := s.conf.LookupFlowIDNumber(flowID)
+			mappedTo, mapped := s.conf.LookupFlowIDNumber(flowID)
 			if !mapped {
 				log.Warnw("unknown flow_id in User-to-User header", nil, "flowID", flowID)
 			} else {
-				originalFrom := callInfo.From.User
-				callInfo.From.User = dispatchNumber
-				log.Infow("Modified From number based on User-to-User flow ID",
-					"originalFrom", originalFrom, "newFrom", callInfo.From.User, "flowID", flowID)
+				originalTo := callInfo.To.User
+				callInfo.To.User = mappedTo
+				log.Infow("Modified To number based on User-to-User flow ID",
+					"originalTo", originalTo, "newTo", callInfo.To.User, "flowID", flowID)
 			}
 		}
 	}
