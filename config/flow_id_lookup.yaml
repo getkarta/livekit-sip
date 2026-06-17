@@ -1,3 +1,4 @@
 # Maps User-to-User flow_id values to dialed (To) numbers for trunk routing.
 # Bundled in the SIP Docker image at /sip/flow_id_lookup.yaml.
 SS_INACTIVITY: "8031136800"
+MF_LUMPSUM: "8035313183"
