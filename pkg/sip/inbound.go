@@ -95,27 +95,34 @@ func inviteHasAuth(r *sip.Request) bool {
 		r.GetHeader("Authorization") != nil
 }
 
-// parseUserToUserFlowID extracts flow_id from a SIP User-to-User header value.
+// parseUserToUser extracts session UUID and flow_id from a SIP User-to-User header.
 // Expected payload format after decoding: "<uuid>|<flow_id>".
-func parseUserToUserFlowID(headerValue string) (string, bool) {
+func parseUserToUser(headerValue string) (sessionID, flowID string, ok bool) {
 	if headerValue == "" {
-		return "", false
+		return "", "", false
 	}
 
 	payload, ok := decodeUserToUserPayload(headerValue)
 	if !ok {
-		return "", false
+		return "", "", false
 	}
 
 	parts := strings.SplitN(payload, "|", 2)
 	if len(parts) != 2 {
-		return "", false
+		return "", "", false
 	}
-	flowID := strings.TrimSpace(parts[1])
+	sessionID = strings.TrimSpace(parts[0])
+	flowID = strings.TrimSpace(parts[1])
 	if flowID == "" {
-		return "", false
+		return "", "", false
 	}
-	return flowID, true
+	return sessionID, flowID, true
+}
+
+// parseUserToUserFlowID extracts flow_id from a SIP User-to-User header value.
+func parseUserToUserFlowID(headerValue string) (string, bool) {
+	_, flowID, ok := parseUserToUser(headerValue)
+	return flowID, ok
 }
 
 func decodeUserToUserPayload(headerValue string) (string, bool) {
@@ -440,7 +447,10 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 	rheaders := cc.RemoteHeaders()
 
 	if uui := rheaders.GetHeader("User-to-User"); uui != nil {
-		if flowID, ok := parseUserToUserFlowID(uui.Value()); ok {
+		uuiRaw := uui.Value()
+		if sessionID, flowID, ok := parseUserToUser(uuiRaw); ok {
+			log = log.WithValues("uuiSessionID", sessionID, "uuiFlowID", flowID)
+			log.Infow("User-to-User header parsed", "uuiRaw", uuiRaw)
 			mappedTo, mapped := s.conf.LookupFlowIDNumber(flowID)
 			if !mapped {
 				log.Warnw("unknown flow_id in User-to-User header", nil, "flowID", flowID)
@@ -450,6 +460,8 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 				log.Infow("Modified To number based on User-to-User flow ID",
 					"originalTo", originalTo, "newTo", callInfo.To.User, "flowID", flowID)
 			}
+		} else {
+			log.Infow("User-to-User header present but not parsed", "uuiRaw", uuiRaw)
 		}
 	}
 
@@ -681,6 +693,10 @@ type inboundCall struct {
 	stats       Stats
 	jitterBuf   bool
 	projectID   string
+
+	// Diagnostic timing/outcome fields for capacity-miss debugging.
+	acceptedAt      atomic.Int64 // unix nano when SIP 200 OK was accepted; 0 if still ringing
+	audioSubscribed atomic.Bool
 }
 
 func (s *Server) newInboundCall(
@@ -737,6 +753,81 @@ func (c *inboundCall) log() logger.Logger {
 
 func (c *inboundCall) appendLogValues(kvs ...any) {
 	c.setLog(c.log().WithValues(kvs...))
+}
+
+func (c *inboundCall) markAccepted() {
+	c.acceptedAt.CompareAndSwap(0, time.Now().UnixNano())
+}
+
+func (c *inboundCall) callPhase() string {
+	if c.acceptedAt.Load() != 0 || c.started.IsBroken() {
+		return "active"
+	}
+	return "ringing"
+}
+
+func (c *inboundCall) callTiming(now time.Time) (ringMs, activeMs, totalMs int64) {
+	if c.callStart.IsZero() {
+		return 0, 0, 0
+	}
+	totalMs = now.Sub(c.callStart).Milliseconds()
+	if acc := c.acceptedAt.Load(); acc != 0 {
+		accepted := time.Unix(0, acc)
+		ringMs = accepted.Sub(c.callStart).Milliseconds()
+		if ringMs < 0 {
+			ringMs = 0
+		}
+		activeMs = now.Sub(accepted).Milliseconds()
+		if activeMs < 0 {
+			activeMs = 0
+		}
+		return ringMs, activeMs, totalMs
+	}
+	return totalMs, 0, totalMs
+}
+
+// roomDiagSnapshot reports whether an agent (non-SIP remote participant) joined
+// and how many remote participants are currently in the room.
+func (c *inboundCall) roomDiagSnapshot() (agentJoined bool, remoteCount int) {
+	if c.lkRoom == nil {
+		return false, 0
+	}
+	if r, ok := c.lkRoom.(*Room); ok {
+		agentJoined = r.AgentJoined()
+		remoteCount = r.RemoteParticipantCount()
+		// Prefer live count when the SDK room is available.
+		if room := r.Room(); room != nil {
+			if n := len(room.GetRemoteParticipants()); n > remoteCount {
+				remoteCount = n
+			}
+		}
+		return agentJoined, remoteCount
+	}
+	if room := c.lkRoom.Room(); room != nil {
+		parts := room.GetRemoteParticipants()
+		remoteCount = len(parts)
+		for _, p := range parts {
+			if p.Kind() != lksdk.ParticipantSIP {
+				agentJoined = true
+			}
+		}
+	}
+	return agentJoined, remoteCount
+}
+
+func (c *inboundCall) outcomeLogValues() []any {
+	now := time.Now()
+	ringMs, activeMs, totalMs := c.callTiming(now)
+	agentJoined, remoteCount := c.roomDiagSnapshot()
+	return []any{
+		"phase", c.callPhase(),
+		"ringMs", ringMs,
+		"activeMs", activeMs,
+		"totalMs", totalMs,
+		"agentJoined", agentJoined,
+		"audioSubscribed", c.audioSubscribed.Load(),
+		"remoteParticipantCount", remoteCount,
+	}
 }
 
 func (c *inboundCall) mediaTimeout(ctx context.Context) error {
@@ -900,6 +991,7 @@ func (c *inboundCall) handleInvite(ctx context.Context, tid traceid.ID, req *sip
 			c.close(ctx, true, callAcceptFailed, "accept-failed")
 			return false, err
 		}
+		c.markAccepted()
 		if !c.s.conf.Experimental.InboundWaitACK {
 			ackReceived = c.cc.InviteACK()
 			// Start this timer right after the Accept.
@@ -969,7 +1061,7 @@ func (c *inboundCall) handleInvite(ctx context.Context, tid traceid.ID, req *sip
 	c.lkRoom.Subscribe()
 	tsub()
 	if !pinPrompt {
-		c.log().Infow("Waiting for track subscription(s)")
+		c.log().Infow("Waiting for agent audio while ringing")
 		// For dispatches without pin, we first wait for LK participant to become available,
 		// and also for at least one track subscription. In the meantime we keep ringing.
 		if ok, err := c.waitSubscribe(ctx, disp.RingingTimeout); !ok {
@@ -1137,6 +1229,7 @@ func (c *inboundCall) waitSubscribe(ctx context.Context, timeout time.Duration) 
 	defer timer.Stop()
 	select {
 	case <-c.cc.Cancelled():
+		c.log().Infow("caller cancelled while waiting for agent audio", c.outcomeLogValues()...)
 		c.closeWithCancelled(ctx)
 		return false, nil
 	case <-ctx.Done():
@@ -1148,9 +1241,14 @@ func (c *inboundCall) waitSubscribe(ctx context.Context, timeout time.Duration) 
 	case <-c.media.Timeout():
 		return false, c.mediaTimeout(ctx)
 	case <-timer.C:
+		c.log().Infow("timed out waiting for agent audio",
+			append(c.outcomeLogValues(), "timeout", timeout.String())...,
+		)
 		c.close(ctx, false, callDropped, "cannot-subscribe")
 		return false, psrpc.NewErrorf(psrpc.DeadlineExceeded, "room subscription timed out")
 	case <-c.lkRoom.Subscribed():
+		c.audioSubscribed.Store(true)
+		c.log().Infow("agent audio subscribed, answering SIP", c.outcomeLogValues()...)
 		return true, nil
 	}
 }
@@ -1255,6 +1353,7 @@ func (c *inboundCall) close(ctx context.Context, error bool, status CallStatus, 
 	c.setStatus(status)
 	c.mon.CallTerminate(reason)
 	isWarn := error || status == callHangupMedia
+	log = log.WithValues(c.outcomeLogValues()...)
 	if isWarn {
 		log.Warnw("Closing inbound call with error", nil)
 	} else {
@@ -1441,6 +1540,7 @@ func (c *inboundCall) joinRoom(ctx context.Context, rconf RoomConfig, status Cal
 		c.close(ctx, true, callDropped, "participant-failed")
 		return errors.Wrap(err, "cannot create LiveKit participant")
 	}
+	c.log().Infow("SIP participant joined room, waiting for agent")
 	return nil
 }
 

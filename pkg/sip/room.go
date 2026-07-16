@@ -178,6 +178,10 @@ type Room struct {
 	stopped    core.Fuse
 	closed     core.Fuse
 	stats      *RoomStats
+
+	// Diagnostics for correlating SIP cancels with missing agent workers.
+	agentJoined atomic.Bool
+	remoteCount atomic.Int32
 }
 
 type ParticipantConfig struct {
@@ -252,9 +256,23 @@ func (r *Room) Room() *lksdk.Room {
 	return r.room
 }
 
+func (r *Room) AgentJoined() bool {
+	if r == nil {
+		return false
+	}
+	return r.agentJoined.Load()
+}
+
+func (r *Room) RemoteParticipantCount() int {
+	if r == nil {
+		return 0
+	}
+	return int(r.remoteCount.Load())
+}
+
 func (r *Room) participantJoin(rp *lksdk.RemoteParticipant) {
-	log := r.roomLog.WithValues("participant", rp.Identity(), "pID", rp.SID())
-	log.Debugw("participant joined")
+	log := r.roomLog.WithValues("participant", rp.Identity(), "pID", rp.SID(), "kind", rp.Kind())
+	r.remoteCount.Add(1)
 	switch rp.Kind() {
 	case lksdk.ParticipantSIP:
 		// Avoid a deadlock where two SIP participant join a room and won't publish their track.
@@ -262,12 +280,22 @@ func (r *Room) participantJoin(rp *lksdk.RemoteParticipant) {
 		// So we just assume SIP participants will eventually start speaking.
 		r.subscribed.Break()
 		log.Infow("unblocking subscription - second sip participant is in the room")
+	default:
+		r.agentJoined.Store(true)
+		log.Infow("remote participant joined room")
 	}
 }
 
 func (r *Room) participantLeft(rp *lksdk.RemoteParticipant) {
-	log := r.roomLog.WithValues("participant", rp.Identity(), "pID", rp.SID())
-	log.Debugw("participant left")
+	log := r.roomLog.WithValues("participant", rp.Identity(), "pID", rp.SID(), "kind", rp.Kind())
+	if n := r.remoteCount.Add(-1); n < 0 {
+		r.remoteCount.Store(0)
+	}
+	if rp.Kind() != lksdk.ParticipantSIP {
+		log.Infow("remote participant left room")
+	} else {
+		log.Debugw("participant left")
+	}
 }
 
 func (r *Room) subscribeTo(pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
