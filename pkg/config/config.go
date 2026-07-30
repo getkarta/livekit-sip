@@ -126,6 +126,11 @@ type Config struct {
 	// numbers used for trunk and dispatch rule matching.
 	FlowIDLookup map[string]string `yaml:"flow_id_lookup"`
 
+	// OutboundNodeIPs is the set of nat_1_to_1_ip values allowed to handle outbound
+	// CreateSIPParticipant jobs. Usually loaded from SSM
+	// (/livekit/{ENV}/sip/outbound_node_ips). Empty means no filter.
+	OutboundNodeIPs []string `yaml:"outbound_node_ips"`
+
 	// Experimental, these option might go away without notice.
 	Experimental struct {
 		// InboundWaitACK forces SIP to wait for an ACK to 200 OK before proceeding with the call.
@@ -228,6 +233,10 @@ func (c *Config) Init() error {
 	}
 
 	if err := c.loadFlowIDLookup(); err != nil {
+		return err
+	}
+
+	if err := c.loadOutboundNodeIPs(); err != nil {
 		return err
 	}
 

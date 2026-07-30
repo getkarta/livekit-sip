@@ -17,7 +17,6 @@ package sip
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -314,29 +313,12 @@ func (s *Service) CreateSIPParticipant(ctx context.Context, req *rpc.InternalCre
 
 func (s *Service) CreateSIPParticipantAffinity(ctx context.Context, req *rpc.InternalCreateSIPParticipantRequest) float32 {
 	// TODO: scale affinity based on a number or active calls?
-	allowed := getAllowedNodeIPs(req.GetParticipantAttributes())
-	if allowed == nil {
-		return 0.5
+	// Outbound routing is decided from config (SSM /livekit/{ENV}/sip/outbound_node_ips),
+	// not from caller participant_attributes.
+	if !s.conf.AllowsOutbound() {
+		return 0
 	}
-	myIP := s.conf.NAT1To1IP
-	for _, ip := range allowed {
-		if ip == myIP {
-			return 0.5
-		}
-	}
-	return 0
-}
-
-func getAllowedNodeIPs(attrs map[string]string) []string {
-	val, ok := attrs["allowed_node_ips"]
-	if !ok || val == "" {
-		return nil
-	}
-	var ips []string
-	if err := json.Unmarshal([]byte(val), &ips); err != nil {
-		return nil
-	}
-	return ips
+	return 0.5
 }
 
 func (s *Service) TransferSIPParticipant(ctx context.Context, req *rpc.InternalTransferSIPParticipantRequest) (*emptypb.Empty, error) {
