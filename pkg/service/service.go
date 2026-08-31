@@ -37,6 +37,7 @@ import (
 	"github.com/livekit/sip/pkg/stats"
 
 	"github.com/livekit/sip/pkg/config"
+	"github.com/livekit/sip/pkg/customsip"
 	"github.com/livekit/sip/pkg/sip"
 	"github.com/livekit/sip/version"
 )
@@ -52,10 +53,11 @@ type Service struct {
 	psrpcClient rpc.IOInfoClient
 	bus         psrpc.MessageBus
 
-	promServer   *http.Server
-	pprofServer  *http.Server
-	healthServer *http.Server
-	rpcSIPServer rpc.SIPInternalServer
+	promServer    *http.Server
+	pprofServer   *http.Server
+	healthServer  *http.Server
+	privateServer *http.Server
+	rpcSIPServer  rpc.SIPInternalServer
 
 	sipServiceStop        sipServiceStopFunc
 	sipServiceActiveCalls sipServiceActiveCallsFunc
@@ -123,6 +125,30 @@ func NewService(
 			_, _ = w.Write([]byte(st.String()))
 		})
 	}
+	if conf.DirectRoutesActive() && conf.PrivateListenAddr != "" {
+		mux := http.NewServeMux()
+		h := &customsip.Handler{
+			Store: conf.DirectRoutes,
+			OnReplace: func(size int, err error) {
+				result := "ok"
+				if err != nil {
+					result = "error"
+				}
+				s.mon.DirectSIPMapReplace("private_put", result)
+				if err == nil {
+					s.mon.DirectSIPMapSize(size)
+					s.log.Infow("custom-sip routes replaced via private PUT", "size", size)
+				} else {
+					s.log.Warnw("custom-sip private PUT rejected", err)
+				}
+			},
+		}
+		h.Mount(mux)
+		s.privateServer = &http.Server{
+			Addr:    conf.PrivateListenAddr,
+			Handler: mux,
+		}
+	}
 	return s
 }
 
@@ -163,6 +189,18 @@ func (s *Service) Run() error {
 			return err
 		}
 		defer l.Close()
+		go func() {
+			_ = srv.Serve(l)
+		}()
+	}
+
+	if srv := s.privateServer; srv != nil {
+		l, err := net.Listen("tcp", srv.Addr)
+		if err != nil {
+			return err
+		}
+		defer l.Close()
+		s.log.Infow("custom-sip private HTTP listening", "addr", srv.Addr, "path", customsip.RoutesPath)
 		go func() {
 			_ = srv.Serve(l)
 		}()

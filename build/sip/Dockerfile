@@ -27,7 +27,13 @@ RUN apt-get update && apt-get install -y pkg-config libopus-dev libopusfile-dev 
 # download go modules
 COPY go.mod .
 COPY go.sum .
-RUN go mod download
+# Retry GOPROXY stream errors (INTERNAL_ERROR / flaky proxy.golang.org).
+RUN n=0; until go mod download; do \
+      n=$((n+1)); \
+      if [ "$n" -ge 5 ]; then exit 1; fi; \
+      echo "go mod download failed (attempt $n), retrying..."; \
+      sleep $((n * 5)); \
+    done
 
 # copy source
 COPY res/ res/

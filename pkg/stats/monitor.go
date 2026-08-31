@@ -80,6 +80,9 @@ type Monitor struct {
 	transfersSucceeded       *prometheus.CounterVec
 	transfersFailed          *prometheus.CounterVec
 	transfersActive          *prometheus.GaugeVec
+	directSIPFlowRewrite     *prometheus.CounterVec
+	directSIPMapSize         prometheus.Gauge
+	directSIPMapReplace      *prometheus.CounterVec
 
 	cpu            *hwstats.CPUStats
 	maxUtilization float64
@@ -294,6 +297,30 @@ func (m *Monitor) Start(conf *config.Config) error {
 		ConstLabels: prometheus.Labels{"node_id": conf.NodeID},
 	}, []string{"dir"}))
 
+	m.directSIPFlowRewrite = mustRegister(m, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace:   "livekit",
+		Subsystem:   "sip",
+		Name:        "direct_sip_flow_rewrite_total",
+		Help:        "Direct-SIP User-to-User flow_id To-rewrite lookups",
+		ConstLabels: prometheus.Labels{"node_id": conf.NodeID},
+	}, []string{"result"}))
+
+	m.directSIPMapSize = mustRegister(m, prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace:   "livekit",
+		Subsystem:   "sip",
+		Name:        "direct_sip_map_size",
+		Help:        "Number of flow_id → route_key entries in the in-memory direct-SIP map",
+		ConstLabels: prometheus.Labels{"node_id": conf.NodeID},
+	}))
+
+	m.directSIPMapReplace = mustRegister(m, prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace:   "livekit",
+		Subsystem:   "sip",
+		Name:        "direct_sip_map_replace_total",
+		Help:        "Direct-SIP in-memory map replace attempts",
+		ConstLabels: prometheus.Labels{"node_id": conf.NodeID},
+	}, []string{"source", "result"}))
+
 	m.started.Break()
 
 	return nil
@@ -496,4 +523,29 @@ func (m *Monitor) TransferFailed(dir CallDir, reason string, changeActive bool) 
 	if changeActive {
 		m.transfersActive.WithLabelValues(dir.String()).Dec()
 	}
+}
+
+func (m *Monitor) DirectSIPFlowRewrite(hit bool) {
+	if m == nil || m.directSIPFlowRewrite == nil {
+		return
+	}
+	result := "miss"
+	if hit {
+		result = "hit"
+	}
+	m.directSIPFlowRewrite.WithLabelValues(result).Inc()
+}
+
+func (m *Monitor) DirectSIPMapSize(size int) {
+	if m == nil || m.directSIPMapSize == nil {
+		return
+	}
+	m.directSIPMapSize.Set(float64(size))
+}
+
+func (m *Monitor) DirectSIPMapReplace(source, result string) {
+	if m == nil || m.directSIPMapReplace == nil {
+		return
+	}
+	m.directSIPMapReplace.WithLabelValues(source, result).Inc()
 }

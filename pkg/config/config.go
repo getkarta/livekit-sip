@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -32,6 +33,7 @@ import (
 	"github.com/livekit/psrpc"
 	lksdk "github.com/livekit/server-sdk-go/v2"
 
+	"github.com/livekit/sip/pkg/customsip"
 	"github.com/livekit/sip/pkg/errors"
 )
 
@@ -124,7 +126,17 @@ type Config struct {
 
 	// FlowIDLookup maps flow_id values from the User-to-User SIP header to dialed
 	// numbers used for trunk and dispatch rule matching.
+	// Kept as a YAML fallback / seed while migrating to DirectRoutes.
 	FlowIDLookup map[string]string `yaml:"flow_id_lookup"`
+
+	// Direct SIP dynamic routing (replaces baked flow_id_lookup.yaml).
+	DirectRoutesEnabled      bool   `yaml:"direct_routes_enabled"`
+	DirectRoutesBootstrapURL string `yaml:"direct_routes_bootstrap_url"`
+	// PrivateListenAddr is the HTTP listen addr for live map updates, e.g. ":8080".
+	PrivateListenAddr string `yaml:"private_listen_addr"`
+
+	// DirectRoutes is the in-memory custom-SIP store (source-scoped routes + extractors).
+	DirectRoutes *customsip.Store `yaml:"-"`
 
 	// OutboundNodeIPs is the set of nat_1_to_1_ip values allowed to handle outbound
 	// CreateSIPParticipant jobs. Usually loaded from SSM
@@ -169,16 +181,86 @@ func (c *Config) loadFlowIDLookup() error {
 	return nil
 }
 
-// LookupFlowIDNumber returns the dialed number configured for a flow_id.
-func (c *Config) LookupFlowIDNumber(flowID string) (string, bool) {
+// LookupFlowExtractor returns the header parser for an inbound INVITE source IP.
+func (c *Config) LookupFlowExtractor(sourceIP string) customsip.FlowExtractor {
+	if c == nil || c.DirectRoutes == nil {
+		return customsip.DefaultFlowExtractor
+	}
+	return c.DirectRoutes.LookupExtractor(sourceIP)
+}
+
+// LookupFlowIDNumber resolves flow_id to route_key for sourceIP.
+// Prefers the in-memory DirectRoutes store, then falls back to YAML FlowIDLookup.
+func (c *Config) LookupFlowIDNumber(sourceIP, flowID string) (string, bool) {
 	if c == nil || flowID == "" {
 		return "", false
+	}
+	if c.DirectRoutes != nil {
+		if number, ok := c.DirectRoutes.LookupRoute(sourceIP, flowID); ok {
+			return number, true
+		}
 	}
 	number, ok := c.FlowIDLookup[flowID]
 	if !ok || number == "" {
 		return "", false
 	}
 	return number, true
+}
+
+func envTruthy(name string) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func (c *Config) loadDirectRoutesConfig() {
+	if envTruthy("SIP_DIRECT_ROUTES_ENABLED") {
+		c.DirectRoutesEnabled = true
+	}
+	if v := strings.TrimSpace(os.Getenv("SIP_DIRECT_ROUTES_BOOTSTRAP_URL")); v != "" {
+		c.DirectRoutesBootstrapURL = v
+	}
+	if v := firstNonEmpty(os.Getenv("SIP_PRIVATE_LISTEN_ADDR"), os.Getenv("SIP_ADMIN_LISTEN_ADDR")); v != "" {
+		c.PrivateListenAddr = v
+	}
+
+	// Auto-enable when bootstrap or private listener is configured.
+	if c.DirectRoutesBootstrapURL != "" || c.PrivateListenAddr != "" {
+		c.DirectRoutesEnabled = true
+	}
+}
+
+// InitDirectRoutes allocates the in-memory map and seeds it from YAML lookup.
+func (c *Config) InitDirectRoutes() {
+	if !c.DirectRoutesEnabled {
+		return
+	}
+	if c.DirectRoutes == nil {
+		c.DirectRoutes = customsip.NewStore()
+	}
+	if len(c.FlowIDLookup) > 0 {
+		c.DirectRoutes.ReplaceAll(customsip.Config{
+			Default: &customsip.SourceConfig{Routes: c.FlowIDLookup},
+		})
+	}
+}
+
+// DirectRoutesActive reports whether dynamic direct-SIP routing is enabled.
+func (c *Config) DirectRoutesActive() bool {
+	return c != nil && c.DirectRoutesEnabled && c.DirectRoutes != nil
 }
 
 func NewConfig(confString string) (*Config, error) {
@@ -235,6 +317,9 @@ func (c *Config) Init() error {
 	if err := c.loadFlowIDLookup(); err != nil {
 		return err
 	}
+
+	c.loadDirectRoutesConfig()
+	c.InitDirectRoutes()
 
 	if err := c.loadOutboundNodeIPs(); err != nil {
 		return err
