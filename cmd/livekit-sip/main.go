@@ -33,6 +33,7 @@ import (
 	"github.com/livekit/sip/pkg/stats"
 
 	"github.com/livekit/sip/pkg/config"
+	"github.com/livekit/sip/pkg/customsip"
 	"github.com/livekit/sip/pkg/errors"
 	"github.com/livekit/sip/pkg/service"
 	"github.com/livekit/sip/pkg/sip"
@@ -105,6 +106,33 @@ func runService(ctx context.Context, c *cli.Command) error {
 	}
 	svc := service.NewService(conf, log, sipsrv, sipsrv.Stop, sipsrv.ActiveCalls, psrpcClient, bus, mon)
 	sipsrv.SetHandler(svc)
+
+	if conf.DirectRoutesActive() {
+		if conf.DirectRoutes != nil {
+			mon.DirectSIPMapSize(conf.DirectRoutes.Size())
+		}
+		if conf.DirectRoutesBootstrapURL != "" {
+			go customsip.BootstrapLoop(
+				context.Background(),
+				log,
+				conf.DirectRoutesBootstrapURL,
+				conf.DirectRoutes,
+				func(size int, err error) {
+					result := "ok"
+					if err != nil {
+						result = "error"
+					}
+					mon.DirectSIPMapReplace("bootstrap", result)
+					if err == nil {
+						mon.DirectSIPMapSize(size)
+					}
+				},
+			)
+		} else {
+			log.Infow("direct-sip routes enabled without bootstrap URL; using YAML seed / private PUT only",
+				"mapSize", conf.DirectRoutes.Size())
+		}
+	}
 
 	if err = sipsrv.Start(); err != nil {
 		return err

@@ -17,7 +17,6 @@ package sip
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -49,6 +48,7 @@ import (
 	"github.com/livekit/sipgo/sip"
 
 	"github.com/livekit/sip/pkg/config"
+	"github.com/livekit/sip/pkg/customsip"
 	"github.com/livekit/sip/pkg/stats"
 	"github.com/livekit/sip/res"
 )
@@ -93,82 +93,6 @@ type inboundCallInfo struct {
 func inviteHasAuth(r *sip.Request) bool {
 	return r.GetHeader("Proxy-Authorization") != nil ||
 		r.GetHeader("Authorization") != nil
-}
-
-// parseUserToUser extracts session UUID and flow_id from a SIP User-to-User header.
-// Expected payload format after decoding: "<uuid>|<flow_id>".
-func parseUserToUser(headerValue string) (sessionID, flowID string, ok bool) {
-	if headerValue == "" {
-		return "", "", false
-	}
-
-	payload, ok := decodeUserToUserPayload(headerValue)
-	if !ok {
-		return "", "", false
-	}
-
-	parts := strings.SplitN(payload, "|", 2)
-	if len(parts) != 2 {
-		return "", "", false
-	}
-	sessionID = strings.TrimSpace(parts[0])
-	flowID = strings.TrimSpace(parts[1])
-	if flowID == "" {
-		return "", "", false
-	}
-	return sessionID, flowID, true
-}
-
-// parseUserToUserFlowID extracts flow_id from a SIP User-to-User header value.
-func parseUserToUserFlowID(headerValue string) (string, bool) {
-	_, flowID, ok := parseUserToUser(headerValue)
-	return flowID, ok
-}
-
-func decodeUserToUserPayload(headerValue string) (string, bool) {
-	lower := strings.ToLower(headerValue)
-	value := headerValue
-	if idx := strings.Index(value, ";"); idx >= 0 {
-		value = strings.TrimSpace(value[:idx])
-	}
-	if value == "" {
-		return "", false
-	}
-
-	switch {
-	case strings.Contains(lower, "encoding=base64"):
-		return decodeBase64UserToUser(value)
-	case strings.Contains(lower, "encoding=hex"):
-		b, err := hex.DecodeString(value)
-		if err != nil {
-			return "", false
-		}
-		return string(b), true
-	default:
-		if strings.Contains(value, "|") {
-			return value, true
-		}
-		if decoded, ok := decodeBase64UserToUser(value); ok && strings.Contains(decoded, "|") {
-			return decoded, true
-		}
-		return "", false
-	}
-}
-
-func decodeBase64UserToUser(value string) (string, bool) {
-	if b, err := base64.StdEncoding.DecodeString(value); err == nil {
-		return string(b), true
-	}
-	if b, err := base64.RawStdEncoding.DecodeString(value); err == nil {
-		return string(b), true
-	}
-	if b, err := base64.URLEncoding.DecodeString(value); err == nil {
-		return string(b), true
-	}
-	if b, err := base64.RawURLEncoding.DecodeString(value); err == nil {
-		return string(b), true
-	}
-	return "", false
 }
 
 func (c *inboundCallInfo) countInvite(log logger.Logger, req *sip.Request) {
@@ -446,22 +370,47 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 	}
 	rheaders := cc.RemoteHeaders()
 
-	if uui := rheaders.GetHeader("User-to-User"); uui != nil {
-		uuiRaw := uui.Value()
-		if sessionID, flowID, ok := parseUserToUser(uuiRaw); ok {
-			log = log.WithValues("uuiSessionID", sessionID, "uuiFlowID", flowID)
-			log.Infow("User-to-User header parsed", "uuiRaw", uuiRaw)
-			mappedTo, mapped := s.conf.LookupFlowIDNumber(flowID)
-			if !mapped {
+	extractor := s.conf.LookupFlowExtractor(src.Addr().String())
+	legacyUUI := customsip.IsDefaultFlowExtractor(extractor)
+	var headerValue string
+	if h := rheaders.GetHeader(extractor.Header); h != nil {
+		headerValue = h.Value()
+	}
+	if sessionID, flowID, ok := customsip.ParseFlowID(extractor, headerValue); ok {
+		log = log.WithValues("uuiSessionID", sessionID, "uuiFlowID", flowID)
+		if legacyUUI {
+			log.Infow("User-to-User header parsed", "uuiRaw", headerValue)
+		} else {
+			log.Infow("custom-SIP flow_id extracted",
+				"header", extractor.Header, "format", extractor.Format, "flowID", flowID)
+		}
+		mappedTo, mapped := s.conf.LookupFlowIDNumber(src.Addr().String(), flowID)
+		s.mon.DirectSIPFlowRewrite(mapped)
+		if !mapped {
+			if legacyUUI {
 				log.Warnw("unknown flow_id in User-to-User header", nil, "flowID", flowID)
 			} else {
-				originalTo := callInfo.To.User
-				callInfo.To.User = mappedTo
-				log.Infow("Modified To number based on User-to-User flow ID",
-					"originalTo", originalTo, "newTo", callInfo.To.User, "flowID", flowID)
+				log.Warnw("unknown flow_id in custom-SIP header", nil,
+					"flowID", flowID, "header", extractor.Header, "sourceIP", src.Addr().String())
 			}
 		} else {
-			log.Infow("User-to-User header present but not parsed", "uuiRaw", uuiRaw)
+			originalTo := callInfo.To.User
+			callInfo.To.User = mappedTo
+			if legacyUUI {
+				log.Infow("Modified To number based on User-to-User flow ID",
+					"originalTo", originalTo, "newTo", callInfo.To.User, "flowID", flowID)
+			} else {
+				log.Infow("Modified To number based on custom-SIP flow ID",
+					"originalTo", originalTo, "newTo", callInfo.To.User, "flowID", flowID,
+					"header", extractor.Header, "sourceIP", src.Addr().String())
+			}
+		}
+	} else if headerValue != "" {
+		if legacyUUI {
+			log.Infow("User-to-User header present but not parsed", "uuiRaw", headerValue)
+		} else {
+			log.Infow("custom-SIP header present but not parsed",
+				"header", extractor.Header, "headerRaw", headerValue, "sourceIP", src.Addr().String())
 		}
 	}
 
