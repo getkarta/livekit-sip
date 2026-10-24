@@ -114,7 +114,7 @@ func (s *Stats) Load() StatsSnapshot {
 }
 
 func (s *Stats) Log(log logger.Logger, callStart time.Time) {
-	const expectedSampleRate = RoomSampleRate
+	expectedSampleRate := roomSampleRate()
 	st := s.Load()
 	log.Infow("call statistics",
 		"stats", st,
@@ -142,6 +142,20 @@ const (
 	RoomSampleRate = 48000
 	RoomResample   = false
 )
+
+func roomSampleRate() int {
+	codecs := msdk.EnabledCodecs()
+	if len(codecs) == 0 {
+		return RoomSampleRate
+	}
+	for _, codec := range codecs {
+		if codec.Info().SampleRate != 8000 {
+			return RoomSampleRate
+		}
+	}
+	// The track is created before negotiation, so every offered codec must be narrowband.
+	return 8000
+}
 
 var staticPayloadTypes = map[uint8]string{
 	0:  "Auto_PCMU/8000",

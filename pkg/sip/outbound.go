@@ -149,7 +149,7 @@ func (c *Client) newCall(ctx context.Context, tid traceid.ID, conf *config.Confi
 		Stats:               &call.stats.Port,
 		NoInputResample:     !RoomResample,
 		IgnorePreanswerData: true,
-	}, RoomSampleRate)
+	}, roomSampleRate())
 	if err != nil {
 		call.close(ctx, errors.Wrap(err, "media failed"), callDropped, "media-failed", livekit.DisconnectReason_UNKNOWN_REASON)
 		return nil, err
@@ -428,8 +428,8 @@ func (c *outboundCall) connectToRoom(ctx context.Context, lkNew RoomConfig, getR
 		return err
 	}
 	// We have to create the track early because we might play a dialtone while SIP connects.
-	// Thus, we are forced to set full sample rate here instead of letting the codec adapt to the SIP source sample rate.
-	local, err := r.NewParticipantTrack(RoomSampleRate)
+	// Use 8 kHz only when all enabled codecs are narrowband; otherwise preserve the full rate.
+	local, err := r.NewParticipantTrack(roomSampleRate())
 	if err != nil {
 		_ = r.Close()
 		return err

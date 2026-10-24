@@ -1096,7 +1096,7 @@ func (c *inboundCall) runMediaConn(tid traceid.ID, offerData []byte, enc livekit
 		LogSignalChanges:    logSignalChanges,
 		Stats:               &c.stats.Port,
 		NoInputResample:     !RoomResample,
-	}, RoomSampleRate)
+	}, roomSampleRate())
 	if err != nil {
 		return nil, err
 	}
@@ -1463,7 +1463,7 @@ func (c *inboundCall) createLiveKitParticipant(ctx context.Context, rconf RoomCo
 
 func (c *inboundCall) publishTrack() error {
 	defer c.mon.StageDurTimer("track-publish")()
-	local, err := c.lkRoom.NewParticipantTrack(RoomSampleRate)
+	local, err := c.lkRoom.NewParticipantTrack(roomSampleRate())
 	if err != nil {
 		_ = c.lkRoom.Close()
 		return err

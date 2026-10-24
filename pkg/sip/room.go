@@ -206,7 +206,7 @@ func NewRoom(log logger.Logger, st *RoomStats) *Room {
 	if st == nil {
 		st = &RoomStats{}
 	}
-	r := &Room{log: log, stats: st, out: msdk.NewSwitchWriter(RoomSampleRate)}
+	r := &Room{log: log, stats: st, out: msdk.NewSwitchWriter(roomSampleRate())}
 
 	var err error
 	r.mix, err = mixer.NewMixer(r.out, rtp.DefFrameDur, 1, mixer.WithStats(&st.Mixer), mixer.WithOutputChannel())
