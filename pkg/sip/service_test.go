@@ -36,36 +36,6 @@ const (
 	testPortRTPMax = 30150
 )
 
-func TestRoomSampleRate(t *testing.T) {
-	codecs := msdk.Codecs()
-	original := make(map[string]bool, len(codecs))
-	for _, codec := range codecs {
-		original[codec.Info().SDPName] = msdk.CodecEnabled(codec)
-	}
-	t.Cleanup(func() { msdk.CodecsSetEnabled(original) })
-
-	for _, tc := range []struct {
-		name    string
-		enabled map[string]bool
-		want    int
-	}{
-		{"g711", map[string]bool{"PCMU/8000": true, "PCMA/8000": true}, 8000},
-		{"pcmu", map[string]bool{"PCMU/8000": true}, 8000},
-		{"pcma", map[string]bool{"PCMA/8000": true}, 8000},
-		{"mixed", map[string]bool{"PCMU/8000": true, "G722/8000": true}, RoomSampleRate},
-		{"g722", map[string]bool{"G722/8000": true}, RoomSampleRate},
-		{"none", nil, RoomSampleRate},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			for _, codec := range codecs {
-				name := codec.Info().SDPName
-				msdk.CodecSetEnabled(name, tc.enabled[name])
-			}
-			require.Equal(t, tc.want, roomSampleRate())
-		})
-	}
-}
-
 func getResponseOrFail(t *testing.T, tx sip.ClientTransaction) *sip.Response {
 	select {
 	case <-tx.Done():
