@@ -428,7 +428,6 @@ func (c *outboundCall) connectToRoom(ctx context.Context, lkNew RoomConfig, getR
 		return err
 	}
 	// We have to create the track early because we might play a dialtone while SIP connects.
-	// Thus, we are forced to set full sample rate here instead of letting the codec adapt to the SIP source sample rate.
 	local, err := r.NewParticipantTrack(RoomSampleRate)
 	if err != nil {
 		_ = r.Close()

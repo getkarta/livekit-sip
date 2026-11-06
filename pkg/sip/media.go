@@ -139,7 +139,7 @@ func ratePPM(rate float64, expected int) float64 {
 
 const (
 	channels       = 1
-	RoomSampleRate = 48000
+	RoomSampleRate = 8000
 	RoomResample   = false
 )
 
