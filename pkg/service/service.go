@@ -50,7 +50,7 @@ type Service struct {
 	log  logger.Logger
 
 	psrpcServer rpc.SIPInternalServerImpl
-	psrpcClient rpc.IOInfoClient
+	psrpcClient rpc.IOInfoSIPClient
 	bus         psrpc.MessageBus
 
 	promServer    *http.Server
@@ -69,7 +69,7 @@ type Service struct {
 
 func NewService(
 	conf *config.Config, log logger.Logger, srv rpc.SIPInternalServerImpl, sipServiceStop sipServiceStopFunc,
-	sipServiceActiveCalls sipServiceActiveCallsFunc, cli rpc.IOInfoClient, bus psrpc.MessageBus, mon *stats.Monitor,
+	sipServiceActiveCalls sipServiceActiveCallsFunc, cli rpc.IOInfoSIPClient, bus psrpc.MessageBus, mon *stats.Monitor,
 ) *Service {
 	s := &Service{
 		conf: conf,
@@ -220,35 +220,31 @@ func (s *Service) Run() error {
 
 	s.log.Debugw("service ready")
 
-	for { // nolint: gosimple
-		select {
-		case <-s.shutdown.Watch():
-			s.log.Infow("shutting down")
-			s.DeregisterCreateSIPParticipantTopic()
+	<-s.shutdown.Watch()
+	s.log.Infow("shutting down")
+	s.DeregisterCreateSIPParticipantTopic()
 
-			if !s.killed.Load() {
-				shutdownTicker := time.NewTicker(5 * time.Second)
-				defer shutdownTicker.Stop()
+	if !s.killed.Load() {
+		shutdownTicker := time.NewTicker(5 * time.Second)
+		defer shutdownTicker.Stop()
 
-				for !s.killed.Load() {
-					st := s.sipServiceActiveCalls()
-					if st.Total() == 0 {
-						break
-					}
-					slices.Sort(st.SampleIDs)
-					s.log.Infow("waiting for calls to finish",
-						"inbound", st.Inbound,
-						"outbound", st.Outbound,
-						"sample", st.SampleIDs,
-					)
-					<-shutdownTicker.C
-				}
+		for !s.killed.Load() {
+			st := s.sipServiceActiveCalls()
+			if st.Total() == 0 {
+				break
 			}
-
-			s.sipServiceStop()
-			return nil
+			slices.Sort(st.SampleIDs)
+			s.log.Infow("waiting for calls to finish",
+				"inbound", st.Inbound,
+				"outbound", st.Outbound,
+				"sample", st.SampleIDs,
+			)
+			<-shutdownTicker.C
 		}
 	}
+
+	s.sipServiceStop()
+	return nil
 }
 
 func (s *Service) GetAuthCredentials(ctx context.Context, call *rpc.SIPCall) (sip.AuthInfo, error) {
@@ -259,7 +255,7 @@ func (s *Service) DispatchCall(ctx context.Context, info *sip.CallInfo) sip.Call
 	return DispatchCall(ctx, s.psrpcClient, s.log, info)
 }
 
-func (s *Service) GetMediaProcessor(_ []livekit.SIPFeature, _ map[string]string) msdk.PCM16Processor {
+func (s *Service) GetMediaProcessor(_ []livekit.SIPFeature, _ map[string]string, _ string, _ sip.MediaProcessorOpts) msdk.PCM16Processor {
 	return nil
 }
 
@@ -299,6 +295,6 @@ func (s *Service) OnInboundInfo(log logger.Logger, callInfo *rpc.SIPCall, header
 
 }
 
-func (s *Service) OnSessionEnd(ctx context.Context, callIdentifier *sip.CallIdentifier, callInfo *livekit.SIPCallInfo, reason string) {
-	s.log.Infow("SIP call ended", "callID", callInfo.CallId, "reason", reason)
+func (s *Service) OnSessionEnd(ctx context.Context, callIdentifier *sip.CallIdentifier, state *sip.CallState, reason string) {
+	s.log.Infow("SIP call ended", "callID", callIdentifier.CallID, "reason", reason)
 }

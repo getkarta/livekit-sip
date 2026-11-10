@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG GOVERSION=1.24
+ARG GOVERSION=1.26
 
 FROM golang:$GOVERSION AS builder
 
@@ -36,7 +36,6 @@ RUN n=0; until go mod download; do \
     done
 
 # copy source
-COPY res/ res/
 COPY cmd/ cmd/
 COPY pkg/ pkg/
 COPY version/ version/
