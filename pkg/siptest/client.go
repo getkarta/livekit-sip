@@ -88,33 +88,36 @@ func NewClient(id string, conf ClientConfig) (*Client, error) {
 		conf.IP = localIP
 		conf.Log.Debug("setting local address", "ip", localIP)
 	}
-	if conf.Port == 0 {
-		conf.Port = 5060 + uint16(rand.Intn(1000))
-	}
 	if conf.Number == "" {
 		conf.Number = "1000"
 	}
 	if conf.Codec == "" {
-		conf.Codec = g711.ULawSDPName
+		conf.Codec = g711.ULawSDPNameOnly
 	}
-	codec := lksdp.CodecByName(conf.Codec).(rtp.AudioCodec)
+	codecConfig := msdk.CodecConfig{SampleRate: 8000}
+	codecInfo, create, ok := lksdp.CodecByNameWith(nil, conf.Codec).Supports(codecConfig)
+	if !ok {
+		return nil, fmt.Errorf("unsupported codec: %q (%+v)", conf.Codec, codecConfig)
+	}
+	codec := create().(msdk.AudioCodec)
+
 	cli := &Client{
 		id:         id,
 		conf:       conf,
 		ack:        make(chan struct{}, 1),
 		log:        conf.Log,
 		audioCodec: codec,
-		audioType:  codec.Info().RTPDefType,
+		audioType:  codecInfo.RTPDefType,
 	}
-	if !codec.Info().RTPIsStatic {
+	if !codecInfo.RTPIsStatic {
 		cli.audioType = 102
 	}
 	cli.mediaConn = rtpconn.NewConn(&rtpconn.ConnConfig{TimeoutCallback: conf.OnMediaTimeout})
 	cli.mediaConn.EnableTimeout(false) // enabled later
-	cli.media = rtp.NewSeqWriter(cli.mediaConn)
+	cli.media = rtp.NewSeqWriter(cli.mediaConn, codec.Info().RTPClockRate)
 	cli.mediaAudio = cli.media.NewStream(cli.audioType, codec.Info().RTPClockRate)
-	cli.mediaDTMF = cli.media.NewStream(101, dtmf.SampleRate)
-	cli.audioOut, err = mixer.NewMixer(cli.audioCodec.EncodeRTP(cli.mediaAudio), rtp.DefFrameDur, 1, mixer.WithOutputChannel())
+	cli.mediaDTMF = cli.media.NewManualStream(101)
+	cli.audioOut, err = mixer.NewMixer(rtp.EncodePCM(cli.mediaAudio, cli.audioCodec), rtp.DefFrameDur, 1, mixer.WithOutputChannel())
 	if err != nil {
 		cli.Close()
 		return nil, err
@@ -177,6 +180,8 @@ func NewClient(id string, conf ClientConfig) (*Client, error) {
 		cli.Close()
 		return nil, err
 	}
+	// cli.conf.Port may be 0 if port was not specified, so we need to set it to the actual port.
+	cli.conf.Port = uint16(l.Addr().(*net.TCPAddr).Port)
 	cli.sipLis = l
 
 	go cli.sipServer.ServeTCP(l)
@@ -189,7 +194,7 @@ type Client struct {
 	conf          ClientConfig
 	log           *slog.Logger
 	ack           chan struct{}
-	audioCodec    rtp.AudioCodec
+	audioCodec    msdk.AudioCodec
 	audioType     byte
 	mediaConn     *rtpconn.Conn
 	mux           *rtp.Mux
@@ -203,7 +208,7 @@ type Client struct {
 	sipLis        net.Listener
 	inviteReq     *sip.Request
 	inviteResp    *sip.Response
-	recordHandler atomic.Pointer[rtp.Handler]
+	recordHandler atomic.Pointer[rtp.HandlerCloser]
 	lastCSeq      atomic.Uint32
 	closed        core.Fuse
 }
@@ -279,7 +284,7 @@ func (c *Client) setupRTPReceiver() {
 
 func (c *Client) Record(w io.WriteCloser) {
 	ws := webmm.NewPCM16Writer(w, c.audioCodec.Info().SampleRate, 1, rtp.DefFrameDur)
-	h := c.audioCodec.DecodeRTP(ws, c.audioType)
+	h := rtp.DecodePCM(ws, c.audioCodec, c.audioType)
 	c.recordHandler.Store(&h)
 }
 
@@ -358,14 +363,15 @@ func (c *Client) Dial(ip string, host string, number string, headers map[string]
 	if err = c.sipClient.WriteRequest(sip.NewAckRequest(req, resp, nil)); err != nil {
 		return err
 	}
-	ip, port, err := parseSDPAnswer(resp.Body())
+	var answer sdp.SessionDescription
+	if err = answer.Unmarshal(resp.Body()); err != nil {
+		return err
+	}
+	dst, err := lksdp.GetAudioDest(&answer, lksdp.GetAudio(&answer))
 	if err != nil {
 		return err
 	}
-	dstAddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", ip, port))
-	if err != nil {
-		return err
-	}
+	dstAddr := net.UDPAddrFromAddrPort(dst)
 	c.inviteReq = req
 	c.inviteResp = resp
 
@@ -379,7 +385,7 @@ func (c *Client) Dial(ip string, host string, number string, headers map[string]
 }
 
 func (c *Client) attemptInvite(ip, host, number string, offer []byte, authHeader string, headers map[string]string, callID string) (*sip.Request, *sip.Response, error) {
-	uri := sip.Uri{User: number, Host: host, UriParams: make(sip.HeaderParams)}
+	uri := sip.Uri{User: number, Host: host}
 	uri.UriParams.Add("transport", "tcp")
 	req := sip.NewRequest(sip.INVITE, uri)
 
@@ -443,7 +449,8 @@ func (c *Client) SendDTMF(digits string) error {
 	c.log.Debug("sending dtmf", "str", digits)
 	w := c.audioOut.NewInput()
 	defer w.Close()
-	return dtmf.Write(context.Background(), w, c.mediaDTMF, c.mediaAudio.GetCurrentTimestamp(), digits)
+	sampleRate := c.audioCodec.Info().RTPClockRate
+	return dtmf.Write(context.Background(), w, c.mediaDTMF, sampleRate, digits)
 }
 
 func (c *Client) SendNotify(eventReq *sip.Request, notifyStatus string) error {
@@ -572,8 +579,8 @@ func (c *Client) createOffer() ([]byte, error) {
 					Formats: []string{strconv.Itoa(int(c.audioType)) + " 101"},
 				},
 				Attributes: []sdp.Attribute{
-					{Key: "rtpmap", Value: fmt.Sprintf("%d %s", c.audioType, c.audioCodec.Info().SDPName)},
-					{Key: "rtpmap", Value: "101 " + dtmf.SDPName},
+					{Key: "rtpmap", Value: fmt.Sprintf("%d %s", c.audioType, c.audioCodec.Info().SDPName())},
+					{Key: "rtpmap", Value: fmt.Sprintf("101 %s/%d", dtmf.SDPNameOnly, c.audioCodec.Info().RTPClockRate)},
 				},
 			},
 		},
@@ -582,7 +589,7 @@ func (c *Client) createOffer() ([]byte, error) {
 	return offer.Marshal()
 }
 
-// Sends PCM audio from a webm file
+// SendAudio sends PCM audio from a webm file
 func (c *Client) SendAudio(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -611,25 +618,13 @@ func (c *Client) SendAudio(path string) error {
 		}
 	}
 
-	i := 0
 	w := c.audioOut.NewInput()
 	defer w.Close()
-
-	for range time.NewTicker(rtp.DefFrameDur).C {
-		if i >= len(audioFrames) {
-			break
-		}
-		if err = w.WriteSample(audioFrames[i]); err != nil {
-			return err
-		}
-		i++
-	}
-	return nil
+	return msdk.PlayAudio[msdk.PCM16Sample](context.Background(), w, rtp.DefFrameDur, audioFrames)
 }
 
 func (c *Client) SendSilence(ctx context.Context) error {
-	const framesPerSec = int(time.Second / rtp.DefFrameDur)
-	buf := make(msdk.PCM16Sample, c.audioCodec.Info().SampleRate/framesPerSec)
+	buf := make(msdk.PCM16Sample, c.audioCodec.Info().SampleRate/rtp.DefFramesPerSec)
 	wr := c.audioOut.NewInput()
 	defer wr.Close()
 
@@ -656,8 +651,7 @@ const (
 // SendSignal generate an audio signal with a given value. It repeats the signal n times, each frame containing one signal.
 // If n <= 0, it will send the signal until the context is cancelled.
 func (c *Client) SendSignal(ctx context.Context, n int, val int) error {
-	const framesPerSec = int(time.Second / rtp.DefFrameDur)
-	signal := make(msdk.PCM16Sample, c.audioCodec.Info().SampleRate/framesPerSec)
+	signal := make(msdk.PCM16Sample, c.audioCodec.Info().SampleRate/rtp.DefFramesPerSec)
 	audiotest.GenSignal(signal, []audiotest.Wave{{Ind: val, Amp: signalAmp}})
 	wr := c.audioOut.NewInput()
 	defer wr.Close()
@@ -666,11 +660,7 @@ func (c *Client) SendSignal(ctx context.Context, n int, val int) error {
 
 	ticker := time.NewTicker(rtp.DefFrameDur)
 	defer ticker.Stop()
-	i := 0
-	for {
-		if n > 0 && i >= n {
-			break
-		}
+	for i := 0; n <= 0 || i < n; i++ {
 		select {
 		case <-ctx.Done():
 			if n <= 0 {
@@ -684,7 +674,6 @@ func (c *Client) SendSignal(ctx context.Context, n int, val int) error {
 		if err := wr.WriteSample(signal); err != nil {
 			return err
 		}
-		i++
 	}
 	return nil
 }
@@ -697,15 +686,14 @@ func (c *Client) WaitSignals(ctx context.Context, vals []int, w io.WriteCloser) 
 		ws = webmm.NewPCM16Writer(w, sampleRate, 1, rtp.DefFrameDur)
 		defer ws.Close()
 	}
-	const framesPerSec = int(time.Second / rtp.DefFrameDur)
-	decoded := make(msdk.PCM16Sample, sampleRate/framesPerSec)
-	dec := c.audioCodec.DecodeRTP(msdk.NewPCM16BufferWriter(&decoded, sampleRate), c.audioType)
+	decoded := make(msdk.PCM16Sample, sampleRate/rtp.DefFramesPerSec)
+	dec := rtp.DecodePCM(msdk.NewPCM16BufferWriter(&decoded, sampleRate), c.audioCodec, c.audioType)
 	lastLog := time.Now()
 
 	pkts := make(chan *rtp.Packet, 1)
 	done := make(chan struct{})
 
-	h := rtp.Handler(rtp.HandlerFunc(func(hdr *rtp.Header, payload []byte) error {
+	h := rtp.NewNopCloser(rtp.HandlerFunc(func(hdr *rtp.Header, payload []byte) error {
 		// Make sure er do not send on a closed channel
 		select {
 		case <-done:
@@ -797,13 +785,4 @@ func getResponse(tx sip.ClientTransaction) (*sip.Response, error) {
 			}
 		}
 	}
-}
-
-func parseSDPAnswer(in []byte) (string, int, error) {
-	offer := sdp.SessionDescription{}
-	if err := offer.Unmarshal(in); err != nil {
-		return "", 0, err
-	}
-
-	return offer.ConnectionInformation.Address.Address, offer.MediaDescriptions[0].MediaName.Port.Value, nil
 }

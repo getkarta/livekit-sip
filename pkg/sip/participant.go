@@ -18,8 +18,59 @@ import (
 	"time"
 
 	"github.com/livekit/protocol/livekit"
-	"github.com/livekit/sipgo/sip"
+	"github.com/livekit/sip/pkg/stats"
 )
+
+// terminationFromRoomDisconnect classifies a call termination triggered by
+// the LiveKit room closing, given the raw protocol disconnect reason.
+func terminationFromRoomDisconnect(reason livekit.DisconnectReason) stats.Termination {
+	switch reason {
+	case livekit.DisconnectReason_CLIENT_INITIATED,
+		livekit.DisconnectReason_ROOM_CLOSED,
+		livekit.DisconnectReason_ROOM_DELETED,
+		livekit.DisconnectReason_PARTICIPANT_REMOVED:
+		return stats.Success("removed")
+	case livekit.DisconnectReason_JOIN_FAILURE,
+		livekit.DisconnectReason_SIGNAL_CLOSE,
+		livekit.DisconnectReason_STATE_MISMATCH:
+		return stats.ServerError("room-failed")
+	case livekit.DisconnectReason_SERVER_SHUTDOWN:
+		return stats.ServerError("server-shutdown")
+	case livekit.DisconnectReason_CONNECTION_TIMEOUT:
+		return stats.ServerError("connection-timeout")
+	case livekit.DisconnectReason_MIGRATION:
+		return stats.ServerError("migration")
+	case livekit.DisconnectReason_SIP_TRUNK_FAILURE:
+		return stats.ServerError("sip-trunk-failure")
+	case livekit.DisconnectReason_MEDIA_FAILURE:
+		return stats.ServerError("media-failure")
+	case livekit.DisconnectReason_AGENT_ERROR:
+		return stats.ServerError("agent-error")
+	case livekit.DisconnectReason_DUPLICATE_IDENTITY:
+		return stats.ClientError("duplicate-identity")
+	case livekit.DisconnectReason_USER_UNAVAILABLE:
+		return stats.ClientError("user-unavailable")
+	case livekit.DisconnectReason_USER_REJECTED:
+		return stats.ClientError("user-rejected")
+	default:
+		// UNKNOWN_REASON or any future proto value not yet listed here.
+		// Conservative — surface as server_error so the SLI doesn't
+		// silently absorb LK-side issues.
+		return stats.ServerError("room-disconnected")
+	}
+}
+
+// disconnectReasonFromRoomClose returns the reason to report on SIPCallInfo for
+// a call ended by the LiveKit room closing, i.e. not by the SIP peer. The room
+// reason is the only account of why, so report it as-is (ROOM_DELETED,
+// SERVER_SHUTDOWN, ...) rather than flattening it to CLIENT_INITIATED.
+func disconnectReasonFromRoomClose(reason livekit.DisconnectReason) livekit.DisconnectReason {
+	if reason == livekit.DisconnectReason_UNKNOWN_REASON {
+		// No reason reported; keep the historical value.
+		return livekit.DisconnectReason_CLIENT_INITIATED
+	}
+	return reason
+}
 
 const (
 	// maxCallDuration sets a global max call duration.
@@ -45,11 +96,17 @@ var headerToLog = map[string]string{
 }
 
 var headerToAttr = map[string]string{
-	"X-Twilio-AccountSid": livekit.AttrSIPPrefix + "twilio.accountSid",
-	"X-Twilio-CallSid":    livekit.AttrSIPPrefix + "twilio.callSid",
-	"X-call_leg_id":       livekit.AttrSIPPrefix + "telnyx.callLegID",
-	"X-call_session_id":   livekit.AttrSIPPrefix + "telnyx.callSessionID",
-	"X-Lk-Test-Id":        "lktest.id",
+	"X-Twilio-AccountSid":            livekit.AttrSIPPrefix + "twilio.accountSid",
+	"X-Twilio-CallSid":               livekit.AttrSIPPrefix + "twilio.callSid",
+	"X-Twilio-CallToken":             livekit.AttrSIPPrefix + "twilio.callToken",
+	"X-call_leg_id":                  livekit.AttrSIPPrefix + "telnyx.callLegID",
+	"X-call_session_id":              livekit.AttrSIPPrefix + "telnyx.callSessionID",
+	"X-Amzn-ConnectContactId":        livekit.AttrSIPPrefix + "amazon.contactId",
+	"X-Amzn-ConnectInitialContactId": livekit.AttrSIPPrefix + "amazon.initialContactId",
+	"X-Amzn-SourceAccount":           livekit.AttrSIPPrefix + "amazon.sourceAccount",
+	"X-Amzn-SourceArn":               livekit.AttrSIPPrefix + "amazon.sourceArn",
+	"X-Amzn-TargetArn":               livekit.AttrSIPPrefix + "amazon.targetArn",
+	"X-Lk-Test-Id":                   "lktest.id",
 }
 
 type CallStatus int
@@ -66,31 +123,8 @@ func (v CallStatus) Attribute() string {
 		return "automation"
 	case CallActive:
 		return "active"
-	case CallHangup, callHangupMedia:
+	case CallHangup, callHangupMedia, CallCancelled:
 		return "hangup"
-	}
-}
-
-func (v CallStatus) DisconnectReason() livekit.DisconnectReason {
-	switch v {
-	default:
-		return livekit.DisconnectReason_UNKNOWN_REASON
-	case CallHangup, callHangupMedia:
-		// It's the default that LK sets, but map it here explicitly to show the assumption.
-		return livekit.DisconnectReason_CLIENT_INITIATED
-	case callUnavailable:
-		return livekit.DisconnectReason_USER_UNAVAILABLE
-	case callRejected:
-		return livekit.DisconnectReason_USER_REJECTED
-	}
-}
-
-func (v CallStatus) SIPStatus() (sip.StatusCode, string) {
-	switch v {
-	default:
-		return sip.StatusBusyHere, "Rejected"
-	case callMediaFailed:
-		return sip.StatusNotAcceptableHere, "MediaFailed"
 	}
 }
 
@@ -102,6 +136,7 @@ const (
 	CallAutomation
 	CallActive
 	CallHangup
+	CallCancelled
 	callUnavailable
 	callRejected
 	callMediaFailed

@@ -23,13 +23,8 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
-	"sync"
+	"slices"
 	"time"
-
-	"github.com/frostbyte73/core"
-	"github.com/hashicorp/golang-lru/v2/expirable"
-	"github.com/icholy/digest"
-	"golang.org/x/exp/maps"
 
 	msdk "github.com/livekit/media-sdk"
 	"github.com/livekit/protocol/livekit"
@@ -38,14 +33,14 @@ import (
 	"github.com/livekit/protocol/utils/traceid"
 	"github.com/livekit/sipgo"
 	"github.com/livekit/sipgo/sip"
+	"github.com/livekit/sipgo/transaction"
+	"github.com/livekit/sipgo/transport"
 
 	"github.com/livekit/sip/pkg/config"
-	"github.com/livekit/sip/pkg/stats"
 )
 
 const (
-	UserAgent   = "LiveKit"
-	digestLimit = 500
+	UserAgent = "LiveKit"
 )
 
 const (
@@ -58,10 +53,11 @@ var (
 )
 
 type CallInfo struct {
-	TrunkID string
-	Call    *rpc.SIPCall
-	Pin     string
-	NoPin   bool
+	TrunkID         string
+	Call            *rpc.SIPCall
+	Pin             string
+	NoPin           bool
+	ExtraAttributes map[string]string
 }
 
 type AuthResult int
@@ -73,15 +69,27 @@ const (
 	AuthAccept
 	AuthQuotaExceeded
 	AuthNoTrunkFound
+	AuthRouteNotAllowed
+	// AuthRejectedAsError is a rejection the auth service reported as an error
+	// instead of a response.
+	AuthRejectedAsError
+	// AuthFailureOther is a catch-all value.
+	AuthFailureOther
 )
 
 type AuthInfo struct {
-	Result       AuthResult
-	ProjectID    string
-	TrunkID      string
-	Username     string
-	Password     string
-	ProviderInfo *livekit.ProviderInfo
+	Result        AuthResult
+	ProjectID     string
+	TrunkID       string
+	Auth          InboundAuth
+	ProviderInfo  *livekit.ProviderInfo
+	Observability *rpc.SIPCallObservability
+}
+
+type InboundAuth struct {
+	Username string
+	Password string
+	Realm    string
 }
 
 type DispatchResult int
@@ -89,25 +97,27 @@ type DispatchResult int
 const (
 	DispatchAccept = DispatchResult(iota)
 	DispatchRequestPin
-	DispatchNoRuleReject // reject the call with an error
-	DispatchNoRuleDrop   // silently drop the call
+	DispatchNoRuleReject       // reject the call with an error
+	DispatchNoRuleDrop         // silently drop the call
+	DispatchServiceUnavailable // dispatch rule evaluation failed at the transport level
 )
 
 type CallDispatch struct {
-	Result              DispatchResult
-	Room                RoomConfig
-	ProjectID           string
-	TrunkID             string
-	DispatchRuleID      string
-	Headers             map[string]string
-	HeadersToAttributes map[string]string
-	IncludeHeaders      livekit.SIPHeaderOptions
-	AttributesToHeaders map[string]string
-	EnabledFeatures     []livekit.SIPFeature
-	FeatureFlags        map[string]string
-	RingingTimeout      time.Duration
-	MaxCallDuration     time.Duration
-	MediaEncryption     livekit.SIPMediaEncryption
+	Result               DispatchResult
+	Room                 RoomConfig
+	ProjectID            string
+	TrunkID              string
+	DispatchRuleID       string
+	Headers              map[string]string
+	HeadersToAttributes  map[string]string
+	IncludeHeaders       livekit.SIPHeaderOptions
+	AttributesToHeaders  map[string]string
+	EnabledFeatures      []livekit.SIPFeature
+	FeatureFlags         map[string]string
+	RingingTimeout       time.Duration
+	RingingTimeoutStatus livekit.SIPStatusCode
+	MaxCallDuration      time.Duration
+	MediaConfig          *livekit.SIPMediaConfig
 }
 
 type CallIdentifier struct {
@@ -117,95 +127,75 @@ type CallIdentifier struct {
 	SipCallID string
 }
 
+type MediaProcessorOpts struct {
+	InputSampleRate int
+}
+
 type Handler interface {
 	GetAuthCredentials(ctx context.Context, call *rpc.SIPCall) (AuthInfo, error)
 	DispatchCall(ctx context.Context, info *CallInfo) CallDispatch
-	GetMediaProcessor(features []livekit.SIPFeature, featureFlags map[string]string) msdk.PCM16Processor
+	GetMediaProcessor(features []livekit.SIPFeature, featureFlags map[string]string, callID string, opts MediaProcessorOpts) msdk.PCM16Processor
 
 	RegisterTransferSIPParticipantTopic(sipCallId string) error
 	DeregisterTransferSIPParticipantTopic(sipCallId string)
 
 	OnInboundInfo(log logger.Logger, callInfo *rpc.SIPCall, headers Headers)
-	OnSessionEnd(ctx context.Context, callIdentifier *CallIdentifier, callInfo *livekit.SIPCallInfo, reason string)
+	OnSessionEnd(ctx context.Context, callIdentifier *CallIdentifier, state *CallState, reason string)
 }
+
+// HandlerInterceptor wraps a handler function.
+type HandlerInterceptor func(sipgo.RequestHandler) sipgo.RequestHandler
 
 type Server struct {
 	log          logger.Logger
-	mon          *stats.Monitor
-	region       string
 	sipSrv       *sipgo.Server
-	getIOClient  GetIOInfoClient
-	getRoom      GetRoomFunc
 	sipListeners []io.Closer
-	sipUnhandled RequestHandler
 
-	imu               sync.Mutex
-	inProgressInvites []*inProgressInvite
-
-	closing            core.Fuse
-	cmu                sync.RWMutex
-	byRemoteTag        map[RemoteTag]*inboundCall
-	byLocalTag         map[LocalTag]*inboundCall
-	byCallID           map[string]*inboundCall
-	provisionalInvites *expirable.LRU[[2]string, LocalTag]
-
-	infos struct {
-		sync.Mutex
-		byCallID *expirable.LRU[string, *inboundCallInfo]
-	}
-
-	handler Handler
-	conf    *config.Config
-	sconf   *ServiceConfig
-
-	res mediaRes
+	conf         *config.Config
+	sconf        *ServiceConfig
+	interceptors []HandlerInterceptor
 }
 
-type inProgressInvite struct {
-	sipCallID string
-	challenge digest.Challenge
+type rejectedInviteResponse struct {
+	status sip.StatusCode
+	reason string
 }
 
 type ServerOption func(s *Server)
 
-func WithGetRoomServer(fn GetRoomFunc) ServerOption {
+// WithInterceptors configures all sip handlers to be wrapped with the given set
+// of interceptors. Interceptors are applied s.t. the first interceptor is the
+// outermost one.
+func WithInterceptors(interceptors ...HandlerInterceptor) ServerOption {
 	return func(s *Server) {
-		if fn != nil {
-			s.getRoom = fn
-		}
+		s.interceptors = interceptors
 	}
 }
 
-func NewServer(region string, conf *config.Config, log logger.Logger, mon *stats.Monitor, getIOClient GetIOInfoClient, options ...ServerOption) *Server {
+func NewServer(conf *config.Config, log logger.Logger, options ...ServerOption) *Server {
 	if log == nil {
 		log = logger.GetLogger()
 	}
 	s := &Server{
-		log:                log,
-		conf:               conf,
-		region:             region,
-		mon:                mon,
-		getIOClient:        getIOClient,
-		getRoom:            DefaultGetRoomFunc,
-		byRemoteTag:        make(map[RemoteTag]*inboundCall),
-		byLocalTag:         make(map[LocalTag]*inboundCall),
-		byCallID:           make(map[string]*inboundCall),
-		provisionalInvites: expirable.NewLRU[[2]string, LocalTag](maxCallCache, nil, callCacheTTL),
+		log:  log,
+		conf: conf,
 	}
 	for _, option := range options {
 		option(s)
 	}
-	s.infos.byCallID = expirable.NewLRU[string, *inboundCallInfo](maxCallCache, nil, callCacheTTL)
-	s.initMediaRes()
 	return s
-}
-
-func (s *Server) SetHandler(handler Handler) {
-	s.handler = handler
 }
 
 func (s *Server) ContactURI(tr Transport) URI {
 	return getContactURI(s.conf, s.sconf.SignalingIP, tr)
+}
+
+func (s *Server) transportLayer() *transport.Layer {
+	return s.sipSrv.TransportLayer()
+}
+
+func (s *Server) transactionLayer() *transaction.Layer {
+	return s.sipSrv.TransactionLayer()
 }
 
 func (s *Server) startUDP(addr netip.AddrPort) error {
@@ -278,9 +268,15 @@ func (s *Server) startTLS(addr netip.AddrPort, conf *tls.Config) error {
 	return nil
 }
 
-type RequestHandler func(req *sip.Request, tx sip.ServerTransaction) bool
+func (s *Server) wrapHandler(handler sipgo.RequestHandler) sipgo.RequestHandler {
+	ret := handler
+	for _, interceptor := range slices.Backward(s.interceptors) {
+		ret = interceptor(ret)
+	}
+	return ret
+}
 
-func (s *Server) Start(agent *sipgo.UserAgent, sc *ServiceConfig, tlsConf *tls.Config, unhandled RequestHandler) error {
+func (s *Server) Start(agent *sipgo.UserAgent, sc *ServiceConfig, tlsConf *tls.Config, manager CallManager) error {
 	s.sconf = sc
 	s.log.Infow("server starting", "local", s.sconf.SignalingIPLocal, "external", s.sconf.SignalingIP)
 
@@ -303,13 +299,12 @@ func (s *Server) Start(agent *sipgo.UserAgent, sc *ServiceConfig, tlsConf *tls.C
 		return err
 	}
 
-	s.sipSrv.OnOptions(s.onOptions)
-	s.sipSrv.OnInvite(s.onInvite)
-	s.sipSrv.OnAck(s.onAck)
-	s.sipSrv.OnBye(s.onBye)
-	s.sipSrv.OnNotify(s.onNotify)
-	s.sipSrv.OnNoRoute(s.OnNoRoute)
-	s.sipUnhandled = unhandled
+	s.sipSrv.OnOptions(s.wrapHandler(manager.HandleOptions))
+	s.sipSrv.OnInvite(s.wrapHandler(manager.HandleInvite))
+	s.sipSrv.OnAck(s.wrapHandler(manager.HandleAck))
+	s.sipSrv.OnBye(s.wrapHandler(manager.HandleBye))
+	s.sipSrv.OnNotify(s.wrapHandler(manager.HandleNotify))
+	s.sipSrv.OnNoRoute(s.wrapHandler(manager.HandleNoRoute))
 
 	listenIP := s.conf.ListenIP
 	if listenIP == "" {
@@ -338,14 +333,6 @@ func (s *Server) Start(agent *sipgo.UserAgent, sc *ServiceConfig, tlsConf *tls.C
 }
 
 func (s *Server) Stop() {
-	s.closing.Break()
-	s.cmu.Lock()
-	calls := maps.Values(s.byRemoteTag)
-	s.byRemoteTag = make(map[RemoteTag]*inboundCall)
-	s.cmu.Unlock()
-	for _, c := range calls {
-		_ = c.Close()
-	}
 	if s.sipSrv != nil {
 		_ = s.sipSrv.Close()
 	}
@@ -354,10 +341,12 @@ func (s *Server) Stop() {
 	}
 }
 
-func (s *Server) RegisterTransferSIPParticipant(sipCallID LocalTag, i *inboundCall) error {
-	return s.handler.RegisterTransferSIPParticipantTopic(string(sipCallID))
+// TODO(alexfish): Move this into manager.go
+func (cm *callManager) RegisterTransferSIPParticipant(sipCallID LocalTag, i *inboundCall) error {
+	return cm.handler.RegisterTransferSIPParticipantTopic(string(sipCallID))
 }
 
-func (s *Server) DeregisterTransferSIPParticipant(sipCallID LocalTag) {
-	s.handler.DeregisterTransferSIPParticipantTopic(string(sipCallID))
+// TODO(alexfish): Move this into manager.go
+func (cm *callManager) DeregisterTransferSIPParticipant(sipCallID LocalTag) {
+	cm.handler.DeregisterTransferSIPParticipantTopic(string(sipCallID))
 }
