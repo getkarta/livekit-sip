@@ -297,6 +297,12 @@ func (s *Service) Start() error {
 }
 
 func (s *Service) CreateSIPParticipant(ctx context.Context, req *rpc.InternalCreateSIPParticipantRequest) (*rpc.InternalCreateSIPParticipantResponse, error) {
+	// protocol ≥1.45 registers this RPC with affinityFunc=nil, so every node would
+	// otherwise claim outbound. Disallowed nodes skip registration; reject here too.
+	if !s.conf.AllowsOutbound() {
+		return nil, psrpc.NewErrorf(psrpc.PermissionDenied,
+			"node nat_1_to_1_ip %q is not in outbound_node_ips", s.conf.NAT1To1IP)
+	}
 	resp, err := s.manager.CreateSIPParticipant(ctx, req)
 	return resp, siperrors.ApplySIPStatus(err)
 }
@@ -308,16 +314,17 @@ func (s *Service) TransferSIPParticipant(ctx context.Context, req *rpc.InternalT
 func (s *Service) CreateSIPParticipantAffinity(ctx context.Context, req *rpc.InternalCreateSIPParticipantRequest) float32 {
 	// Outbound routing allowlist from config (SSM /livekit/{ENV}/sip/outbound_node_ips),
 	// not from caller participant_attributes. Gate before upstream scoring.
+	// psrpc only hard-skips affinity < 0; 0 still claims. Use -1 for exclusion.
 	if !s.conf.AllowsOutbound() {
-		return 0
+		return -1
 	}
 	if len(s.conf.SIPTrunkIds) > 0 && !slices.Contains(s.conf.SIPTrunkIds, req.GetSipTrunkId()) {
-		return 0
+		return -1
 	}
 	active := float32(s.ActiveCalls().Total())
 	if max := float32(s.conf.MaxActiveCalls); max > 0 {
 		if active >= max {
-			return 0
+			return -1
 		}
 		return 1 - active/max
 	}
