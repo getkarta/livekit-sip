@@ -1317,7 +1317,7 @@ func TestCreateSIPParticipantAffinity_AtCapacity(t *testing.T) {
 	}
 
 	got := s.CreateSIPParticipantAffinity(context.Background(), nil)
-	require.Equal(t, float32(0), got)
+	require.Equal(t, float32(-1), got)
 }
 
 func TestCreateSIPParticipantAffinity_OverCapacity(t *testing.T) {
@@ -1328,7 +1328,7 @@ func TestCreateSIPParticipantAffinity_OverCapacity(t *testing.T) {
 	}
 
 	got := s.CreateSIPParticipantAffinity(context.Background(), nil)
-	require.Equal(t, float32(0), got)
+	require.Equal(t, float32(-1), got)
 }
 
 func TestCreateSIPParticipantAffinity_MixedInboundOutbound(t *testing.T) {
@@ -1365,7 +1365,7 @@ func TestCreateSIPParticipantAffinity_TrunkWhitelist_Rejected(t *testing.T) {
 
 	req := &rpc.InternalCreateSIPParticipantRequest{SipTrunkId: "trunk-c"}
 	got := s.CreateSIPParticipantAffinity(context.Background(), req)
-	require.Equal(t, float32(0), got)
+	require.Equal(t, float32(-1), got)
 }
 
 func TestCreateSIPParticipantAffinity_TrunkWhitelist_EmptyTrunkId(t *testing.T) {
@@ -1376,7 +1376,7 @@ func TestCreateSIPParticipantAffinity_TrunkWhitelist_EmptyTrunkId(t *testing.T) 
 	req := &rpc.InternalCreateSIPParticipantRequest{}
 	got := s.CreateSIPParticipantAffinity(context.Background(), req)
 	// Empty trunk ID is not in the whitelist
-	require.Equal(t, float32(0), got)
+	require.Equal(t, float32(-1), got)
 }
 
 func TestCreateSIPParticipantAffinity_TrunkWhitelist_EmptyList(t *testing.T) {
@@ -1404,10 +1404,10 @@ func TestCreateSIPParticipantAffinity_TrunkWhitelist_WithMaxCalls(t *testing.T) 
 	got := s.CreateSIPParticipantAffinity(context.Background(), req)
 	require.InDelta(t, float32(0.5), got, 0.001)
 
-	// Non-whitelisted trunk: 0 regardless of load
+	// Non-whitelisted trunk: -1 regardless of load
 	req = &rpc.InternalCreateSIPParticipantRequest{SipTrunkId: "trunk-x"}
 	got = s.CreateSIPParticipantAffinity(context.Background(), req)
-	require.Equal(t, float32(0), got)
+	require.Equal(t, float32(-1), got)
 }
 
 // TestTransferSIPParticipantOutcome checks how the RPC reports a finished transfer.
@@ -1712,10 +1712,10 @@ func TestCreateSIPParticipantAffinity_OutboundNodeIPs(t *testing.T) {
 			expected:        1.0,
 		},
 		{
-			name:            "non-matching IP returns zero",
+			name:            "non-matching IP returns -1",
 			natIP:           "10.0.0.1",
 			outboundNodeIPs: []string{"10.0.0.2"},
-			expected:        0,
+			expected:        -1,
 		},
 		{
 			name:            "matching one of multiple IPs",
@@ -1727,7 +1727,7 @@ func TestCreateSIPParticipantAffinity_OutboundNodeIPs(t *testing.T) {
 			name:            "no match among multiple IPs",
 			natIP:           "192.168.1.1",
 			outboundNodeIPs: []string{"10.0.0.1", "13.233.54.246"},
-			expected:        0,
+			expected:        -1,
 		},
 	}
 

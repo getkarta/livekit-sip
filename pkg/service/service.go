@@ -65,6 +65,10 @@ type Service struct {
 	mon      *stats.Monitor
 	shutdown core.Fuse
 	killed   atomic.Bool
+
+	// outboundTopicRegistered is set when this node registered for CreateSIPParticipant.
+	// protocol v1.45+ dropped affinity wiring, so disallowed nodes must not register.
+	outboundTopicRegistered bool
 }
 
 func NewService(
@@ -214,15 +218,29 @@ func (s *Service) Run() error {
 	}
 	defer s.rpcSIPServer.Shutdown()
 
-	if err := s.RegisterCreateSIPParticipantTopic(); err != nil {
-		return err
+	if s.conf.AllowsOutbound() {
+		if err := s.RegisterCreateSIPParticipantTopic(); err != nil {
+			return err
+		}
+		s.outboundTopicRegistered = true
+		s.log.Infow("registered CreateSIPParticipant topic",
+			"nat_1_to_1_ip", s.conf.NAT1To1IP,
+			"outbound_node_ips", s.conf.OutboundNodeIPs,
+		)
+	} else {
+		s.log.Infow("skipping CreateSIPParticipant registration; node not in outbound_node_ips",
+			"nat_1_to_1_ip", s.conf.NAT1To1IP,
+			"outbound_node_ips", s.conf.OutboundNodeIPs,
+		)
 	}
 
 	s.log.Debugw("service ready")
 
 	<-s.shutdown.Watch()
 	s.log.Infow("shutting down")
-	s.DeregisterCreateSIPParticipantTopic()
+	if s.outboundTopicRegistered {
+		s.DeregisterCreateSIPParticipantTopic()
+	}
 
 	if !s.killed.Load() {
 		shutdownTicker := time.NewTicker(5 * time.Second)
