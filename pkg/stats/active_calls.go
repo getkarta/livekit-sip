@@ -13,11 +13,9 @@ func (m *Monitor) RegisterActiveCalls(snapshot func() (inbound, outbound int)) e
 	if snapshot == nil {
 		return fmt.Errorf("active calls snapshot callback is nil")
 	}
-	c := newActiveCallsCollector(m.nodeID, snapshot)
-	if err := prometheus.Register(c); err != nil {
-		return fmt.Errorf("register SIP calls handled collector: %w", err)
-	}
-	m.metrics = append(m.metrics, c)
+	// Same AlreadyRegistered handling as Monitor.Start metrics: tests may start
+	// multiple SIP services with the same node_id in one process.
+	_ = mustRegister(m, newActiveCallsCollector(m.nodeID, snapshot))
 	return nil
 }
 
